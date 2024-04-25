@@ -272,10 +272,12 @@ jobs:
             make BR2_CHECK_DOTCONFIG_OPTS="--github-format --strip-path-prefix=/build/" linux-check-dotconfig
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: haos-image
-          path: output/images/haos_*.img.xz
+          name: haos-image-${{ matrix.board.id }}
+          path: |
+            output/images/haos_*.img.xz
+            output/images/haos_*.raucb
           if-no-files-found: error
 
       - name: Generate build summary

@@ -3,29 +3,18 @@
 name: OS build
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       boards:
         description: 'List of boards to build (comma separated identifiers)'
         required: false
         type: string
-      publish:
-        description: 'Publish build artifacts to R2 (not applicable to forks)'
-        required: true
-        type: boolean
-        default: true
-      run_tests:
-        description: 'Run tests after build'
-        required: true
-        type: boolean
-        default: true
+        default: 'rockpi-4a,rockpi-4a-plus,rockpi-4b,rockpi-4b-plus,rockpi-4c,rock-4c-plus,rock-4se'
       hassio_channel:
         description: 'Release channel to use (default: stable for GH releases, dev otherwise)'
         type: choice
         required: true
-        default: default
+        default: stable
         options:
           - default
           - stable
@@ -82,9 +71,9 @@ jobs:
           PUBLISH_BUILD: ${{ steps.check_publish.outputs.publish_build }}
         run: |
           version_dev="dev$(date --utc +'%Y%m%d')"
-          if [ "${{ env.PUBLISH_BUILD }}" != "true" ] || [ "${{ github.ref }}" != "refs/heads/dev" ]; then
-            version_dev="dev$(date +%s)"
-          fi
+          # if [ "${{ env.PUBLISH_BUILD }}" != "true" ] || [ "${{ github.ref }}" != "refs/heads/dev" ]; then
+          #   version_dev="dev$(date +%s)"
+          # fi
           echo "Development version \"${version_dev}\""
           echo "version_dev=${version_dev}" >> $GITHUB_OUTPUT
 
@@ -240,7 +229,7 @@ jobs:
         run: |
           echo -e "-----BEGIN CERTIFICATE-----\n${RAUC_CERTIFICATE}\n-----END CERTIFICATE-----" > signing-cert.pem
           # 760 days ~ 25 months (the OS support window, with margin)
-          scripts/check-signing-validity.sh signing-cert.pem buildroot-external/ota/rel-ca.pem 760
+          scripts/check-signing-validity.sh signing-cert.pem buildroot-external/ota/rockpi-ca.pem 760
           rm -f signing-cert.pem
 
       - name: Create signing key
@@ -260,7 +249,7 @@ jobs:
     strategy:
       fail-fast: ${{ github.event_name == 'release' }}
       matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
-    runs-on: ubuntu-22.04
+    runs-on: ha_buildhost
 
     steps:
       - name: Checkout source
@@ -301,28 +290,6 @@ jobs:
         with:
           name: signing-key
 
-      - name: Free space on build drive
-        run: |
-          # Inspired by https://github.com/easimon/maximize-build-space/blob/v7/action.yml
-          df -h
-          sudo rm -rf /usr/local/lib/android/sdk/ndk
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo mkdir /mnt/cache
-          sudo mkdir /mnt/output
-          WORKSPACE_OWNER="$(stat -c '%U:%G' "${GITHUB_WORKSPACE}")"
-          # output directory is symlinked for easier access from workspace
-          # but for build container it must be mounted as a volume
-          sudo ln -sf /mnt/output "${GITHUB_WORKSPACE}/output"
-          sudo chown -R "${WORKSPACE_OWNER}" /mnt/cache
-          sudo chown -R "${WORKSPACE_OWNER}" /mnt/output
-          df -h
-
-      - name: "Restore cache: object files"
-        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: /mnt/cache/cc
-          key: haos-cc-${{ matrix.board.id }}
-
       - name: Generate build config
         uses: "./.github/actions/haos-builder-command"
         with:
@@ -351,40 +318,11 @@ jobs:
             make BR2_CHECK_DOTCONFIG_OPTS="--github-format --strip-path-prefix=/build/" linux-check-dotconfig
 
       - name: Upload artifacts
-        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build == 'true' }}
-        working-directory: output/images/
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_OS_ARTIFACTS_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_OS_ARTIFACTS_KEY }}
-        run: |
-          aws s3 sync \
-            ./ \
-            s3://${{ secrets.R2_OS_ARTIFACTS_BUCKET }}/${{ needs.prepare.outputs.version_full }}/ \
-            --exclude "*" \
-            --include "haos_*" \
-            --endpoint-url ${{ secrets.R2_OS_ARTIFACTS_ENDPOINT }}
-
-      - name: Upload release assets
-        if: ${{ github.event_name == 'release' }}
-        uses: shogo82148/actions-upload-release-asset@ee2ae851dc5d938b90075b3ef12c540abfd1ee72 # v1.10.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: output/images/haos_*
-
-      - name: Print cache stats
-        run: |
-          echo "Cache size: $(du -sh /mnt/cache/cc)"
-          echo "Files total: $(find /mnt/cache/cc -mindepth 1 -type f | wc -l)"
-          echo "Old files to remove: $(find /mnt/cache/cc -mindepth 1 -type f -not -anewer output/Makefile | wc -l)"
-          find /mnt/cache/cc -mindepth 1 -type f -not -anewer output/Makefile -delete
-          echo "Cache size after pruning: $(du -sh /mnt/cache/cc)"
-
-      - name: "Save cache: object files"
-        if: github.ref == 'refs/heads/dev'
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: /mnt/cache/cc
-          key: haos-cc-${{ matrix.board.id }}-${{ github.run_id }}
+          name: haos-image
+          path: output/images/haos_*.img.xz
+          if-no-files-found: error
 
       - name: Generate build summary
         run: |
@@ -413,134 +351,3 @@ jobs:
           for f in boot.vfat kernel.img rootfs.erofs overlay.ext4 data.ext4; do
             echo "| ${f} | $(du -b output/images/$f | cut -f1) | $(du -bh output/images/$f | cut -f1) |" >> $GITHUB_STEP_SUMMARY
           done
-
-      - name: Upload OS image artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id != 'ova' }}
-        with:
-          archive: false
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
-          path: |
-            output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.img.xz
-
-      - name: Upload RAUC bundle artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' }}
-        with:
-          archive: false
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
-          path: |
-            output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.raucb
-
-      - name: Upload Open Virtualization Format (OVA) artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
-        with:
-          archive: false
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.ova
-          path: |
-            output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.ova
-
-      - name: Upload QEMU disk image artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        # Create artifact for ova every time - it's used by the called tests workflow
-        if: ${{ matrix.board.id == 'ova' || (github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'generic-aarch64') }}
-        with:
-          archive: false
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.qcow2.xz
-          path: |
-            output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.qcow2.xz
-
-      - name: Upload VMware Virtual Machine Disk (VMDK) artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && (matrix.board.id == 'generic-aarch64' || matrix.board.id == 'ova') }}
-        with:
-          archive: false
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vmdk.zip
-          path: |
-            output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vmdk.zip
-
-      - name: Upload VirtualBox Virtual Disk Image (VDI) artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
-        with:
-          archive: false
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vdi.zip
-          path: |
-            output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vdi.zip
-
-      - name: Upload Virtual Hard Disk v2 (VHDX) artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build != 'true' && matrix.board.id == 'ova' }}
-        with:
-          archive: false
-          name: haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vhdx.zip
-          path: |
-            output/images/haos_${{ matrix.board.id }}-${{ needs.prepare.outputs.version_full }}.vhdx.zip
-
-  test:
-    name: Test OS image
-    if: ${{ github.event_name == 'release' || inputs.run_tests == true }}
-    needs: [ build, prepare ]
-    uses: ./.github/workflows/test.yaml
-    with:
-      version: ${{ needs.prepare.outputs.version_full }}
-
-  update_index:
-    name: Update artifacts index
-    if: ${{ github.event_name != 'release' && needs.prepare.outputs.publish_build == 'true' }}
-    needs: [ build, prepare ]
-    uses: home-assistant/operating-system/.github/workflows/artifacts-index.yaml@dev
-    with:
-      version: ${{ needs.prepare.outputs.version_full }}
-    secrets:
-      R2_OS_ARTIFACTS_ID: ${{ secrets.R2_OS_ARTIFACTS_ID }}
-      R2_OS_ARTIFACTS_KEY: ${{ secrets.R2_OS_ARTIFACTS_KEY }}
-      R2_OS_ARTIFACTS_BUCKET: ${{ secrets.R2_OS_ARTIFACTS_BUCKET }}
-      R2_OS_ARTIFACTS_ENDPOINT: ${{ secrets.R2_OS_ARTIFACTS_ENDPOINT }}
-      CF_ZONE: ${{ secrets.CF_ZONE }}
-      CF_PURGE_TOKEN: ${{ secrets.CF_PURGE_TOKEN }}
-
-  bump_version:
-    name: Bump ${{ needs.prepare.outputs.channel }} channel version
-    if: ${{ github.repository == 'home-assistant/operating-system' && needs.prepare.outputs.publish_build == 'true' && (needs.prepare.outputs.channel != 'dev' || github.ref == 'refs/heads/dev') }}
-    environment: ${{ needs.prepare.outputs.channel }}
-    needs: [ build, prepare ]
-    runs-on: ubuntu-22.04
-
-    steps:
-    - name: Checkout source
-      uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      with:
-        persist-credentials: false
-
-    - name: Initialize git
-      uses: home-assistant/actions/helpers/git-init@master
-      with:
-        name: ${{ secrets.GIT_NAME }}
-        email: ${{ secrets.GIT_EMAIL }}
-        token: ${{ secrets.GIT_TOKEN }}
-
-    - name: Bump Home Assistant OS ${{ needs.prepare.outputs.channel }} channel version
-      uses: home-assistant/actions/helpers/version-push@master
-      with:
-        key: "hassos[]"
-        key-description: "Home Assistant OS"
-        version: ${{ needs.prepare.outputs.version_full }}
-        channel: ${{ needs.prepare.outputs.channel }}
-
-    - name: Bump Home Assistant OS beta channel version on stable release
-      if: ${{ needs.prepare.outputs.channel == 'stable' }}
-      uses: home-assistant/actions/helpers/version-push@master
-      with:
-        key: "hassos[]"
-        key-description: "Home Assistant OS"
-        version: ${{ needs.prepare.outputs.version_full }}
-        channel: beta
-
-    - name: Bump stable Home Assistant version for RPi Imager
-      if: ${{ github.event_name == 'release' && needs.prepare.outputs.channel == 'stable' }}
-      uses: "./.github/actions/bump-rpi-imager-version"
-      with:
-        version: ${{ needs.prepare.outputs.version_full }}
-        release-date: ${{ github.event.release.published_at }}

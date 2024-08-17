@@ -16,7 +16,6 @@ runs:
         -e BUILDER_UID="$(id -u)" \
         -e BUILDER_GID="$(id -g)" \
         -v "${GITHUB_WORKSPACE}:/build" \
-        -v "/mnt/cache:/cache" \
-        -v "/mnt/output:/build/output" \
+        -v "ha-build-cache:/cache" \
         ${{ inputs.image }} \
         ${{ inputs.command }}

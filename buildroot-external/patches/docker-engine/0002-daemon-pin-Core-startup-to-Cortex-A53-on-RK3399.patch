@@ -1,0 +1,270 @@
+Subject: [PATCH] daemon: pin Home Assistant Core startup on RK3399
+
+AWS-LC CPU jitter seeding may abort on the Cortex-A72 cluster. Start
+Core on Cortex-A53 CPUs, then restore the available CPU set after one
+minute and once the Core Unix listener is reachable when configured.
+Use the task spec to apply the temporary mask before Core can run,
+and avoid persisting it as a user-configured Docker CPU limit.
+
+Upstream issue: https://github.com/aws/aws-lc/issues/3604
+
+diff --git a/daemon/start.go b/daemon/start.go
+--- a/daemon/start.go
++++ b/daemon/start.go
+@@ -179,6 +179,8 @@
+ 		return errdefs.System(err)
+ 	}
+ 
++	releaseStartupAffinity := daemon.pinRK3399CoreStartup(ctx, container, spec)
++
+ 	if resetRestartManager {
+ 		container.ResetRestartManager(true)
+ 		container.HasBeenManuallyStopped = false
+@@ -257,6 +259,9 @@
+ 	container.State.SetRunning(ctr, tsk, startupTime)
+ 	container.HasBeenStartedBefore = true
+ 	daemon.setStateCounter(container)
++	if releaseStartupAffinity != nil {
++		go releaseStartupAffinity(tsk)
++	}
+ 
+ 	daemon.initHealthMonitor(container)
+ 
+diff --git a/daemon/start_notlinux.go b/daemon/start_notlinux.go
+--- a/daemon/start_notlinux.go
++++ b/daemon/start_notlinux.go
+@@ -16,3 +16,7 @@
+ func (daemon *Daemon) initializeCreatedTask(ctx context.Context, cfg *config.Config, tsk types.Task, container *container.Container, spec *specs.Spec) error {
+ 	return nil
+ }
++
++func (daemon *Daemon) pinRK3399CoreStartup(context.Context, *container.Container, *specs.Spec) func(types.Task) {
++	return nil
++}
+diff --git a/daemon/rk3399_core_startup.go b/daemon/rk3399_core_startup.go
+new file mode 100644
+--- /dev/null
++++ b/daemon/rk3399_core_startup.go
+@@ -0,0 +1,50 @@
++package daemon
++
++import (
++	"bytes"
++	"fmt"
++	"io/fs"
++	"slices"
++	"strconv"
++	"strings"
++)
++
++const rk3399Compatible = "rockchip,rk3399"
++
++func rk3399A53CPUs(sysfs fs.FS, available map[int]struct{}) string {
++	var a53 []int
++	for cpu := range available {
++		path := fmt.Sprintf("devices/system/cpu/cpu%d/regs/identification/midr_el1", cpu)
++		data, err := fs.ReadFile(sysfs, path)
++		if err != nil {
++			continue
++		}
++		midr, err := strconv.ParseUint(strings.TrimSpace(string(data)), 0, 32)
++		// Select Arm (implementer 0x41) Cortex-A53 (part number 0xd03).
++		if err == nil && midr&0xff00fff0 == 0x4100d030 {
++			a53 = append(a53, cpu)
++		}
++	}
++	if len(a53) == len(available) {
++		return ""
++	}
++	slices.Sort(a53)
++	cpus := make([]string, 0, len(a53))
++	for _, cpu := range a53 {
++		cpus = append(cpus, strconv.Itoa(cpu))
++	}
++	return strings.Join(cpus, ",")
++}
++
++func isRK3399(sysfs fs.FS) bool {
++	data, err := fs.ReadFile(sysfs, "firmware/devicetree/base/compatible")
++	if err != nil {
++		return false
++	}
++	for compatible := range bytes.SplitSeq(data, []byte{0}) {
++		if string(compatible) == rk3399Compatible {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/daemon/rk3399_core_startup_linux.go b/daemon/rk3399_core_startup_linux.go
+new file mode 100644
+--- /dev/null
++++ b/daemon/rk3399_core_startup_linux.go
+@@ -0,0 +1,118 @@
++package daemon
++
++import (
++	"context"
++	"fmt"
++	"net"
++	"os"
++	"path/filepath"
++	"strings"
++	"time"
++
++	"github.com/containerd/log"
++	"github.com/moby/moby/v2/daemon/container"
++	"github.com/moby/moby/v2/daemon/internal/libcontainerd/types"
++	"github.com/opencontainers/runtime-spec/specs-go"
++)
++
++const (
++	rk3399StartupAffinityDuration = time.Minute
++	rk3399StartupPollInterval     = 5 * time.Second
++)
++
++func (daemon *Daemon) pinRK3399CoreStartup(ctx context.Context, ctr *container.Container, spec *specs.Spec) func(types.Task) {
++	if ctr.Name != "/homeassistant" || ctr.Config.Labels["io.hass.type"] != "core" || ctr.HostConfig.CpusetCpus != "" {
++		return nil
++	}
++	if spec.Linux == nil || spec.Linux.Resources == nil {
++		return nil
++	}
++	sysfs := os.DirFS("/sys")
++	if !isRK3399(sysfs) {
++		return nil
++	}
++	sysInfo, err := daemon.RawSysInfo()
++	if err != nil || !sysInfo.Cpuset || sysInfo.Cpus == "" {
++		return nil
++	}
++	a53 := rk3399A53CPUs(sysfs, sysInfo.CPUSets)
++	if a53 == "" {
++		return nil
++	}
++
++	// Set the temporary mask in the task spec. HostConfig keeps the normal mask
++	// even when Core exits or Docker recreates the task before the timer fires.
++	if spec.Linux.Resources.CPU == nil {
++		spec.Linux.Resources.CPU = &specs.LinuxCPU{}
++	}
++	spec.Linux.Resources.CPU.Cpus = a53
++	log.G(ctx).WithField("container", ctr.ID).Infof("RK3399: starting Home Assistant Core on CPUs %s", a53)
++
++	return func(task types.Task) {
++		waitForRK3399CoreStartup(ctr, task, sysInfo.Cpus, coreStartupSocket(spec.Process.Env, task.Pid()))
++	}
++}
++
++func coreStartupSocket(env []string, pid uint32) string {
++	for _, variable := range env {
++		if path, ok := strings.CutPrefix(variable, "SUPERVISOR_CORE_API_SOCKET="); ok && filepath.IsAbs(path) {
++			return filepath.Join(fmt.Sprintf("/proc/%d/root", pid), filepath.Clean(path))
++		}
++	}
++	return ""
++}
++
++func waitForRK3399CoreStartup(ctr *container.Container, task types.Task, cpus, socket string) {
++	deadline := time.Now().Add(rk3399StartupAffinityDuration)
++	ticker := time.NewTicker(rk3399StartupPollInterval)
++	defer ticker.Stop()
++
++	for now := range ticker.C {
++		ctr.Lock()
++		current, err := ctr.GetRunningTask()
++		active := err == nil && current == task && !ctr.State.Restarting && ctr.HostConfig.CpusetCpus == ""
++		paused := ctr.State.Paused
++		ctr.Unlock()
++		if !active {
++			return
++		}
++		if paused || now.Before(deadline) {
++			continue
++		}
++		// Older Core/Supervisor pairs have no private HTTP socket. For those,
++		// the grace period alone covers the Core import during startup.
++		if socket != "" {
++			conn, err := net.DialTimeout("unix", socket, time.Second)
++			if err != nil {
++				continue
++			}
++			conn.Close()
++		}
++
++		if restoreRK3399CoreCPUs(ctr, task, cpus) {
++			return
++		}
++	}
++}
++
++func restoreRK3399CoreCPUs(ctr *container.Container, task types.Task, cpus string) bool {
++	ctr.Lock()
++	defer ctr.Unlock()
++	current, err := ctr.GetRunningTask()
++	if err != nil || current != task || ctr.State.Restarting || ctr.HostConfig.CpusetCpus != "" {
++		return true
++	}
++	if ctr.State.Paused {
++		return false
++	}
++
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	logger := log.G(ctx).WithField("container", ctr.ID)
++	if err := task.UpdateResources(ctx, &types.Resources{CPU: &specs.LinuxCPU{Cpus: cpus}}); err != nil {
++		logger.WithError(err).Warn("RK3399: could not restore Home Assistant Core CPU affinity")
++		return false
++	}
++	logger.Infof("RK3399: Home Assistant Core startup pin released onto CPUs %s", cpus)
++	return true
++}
+diff --git a/daemon/rk3399_core_startup_test.go b/daemon/rk3399_core_startup_test.go
+new file mode 100644
+--- /dev/null
++++ b/daemon/rk3399_core_startup_test.go
+@@ -0,0 +1,44 @@
++package daemon
++
++import (
++	"testing"
++	"testing/fstest"
++)
++
++func TestRK3399Compatible(t *testing.T) {
++	const path = "firmware/devicetree/base/compatible"
++	for _, test := range []struct {
++		name string
++		data string
++		want bool
++	}{
++		{"Rock Pi 4B", "radxa,rockpi4b\x00rockchip,rk3399\x00", true},
++		{"RockPro64", "pine64,rockpro64\x00rockchip,rk3399\x00", true},
++		{"other Rockchip SoC", "rockchip,rk3566\x00", false},
++		{"not an exact match", "rockchip,rk3399-example\x00", false},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			sysfs := fstest.MapFS{path: &fstest.MapFile{Data: []byte(test.data)}}
++			if got := isRK3399(sysfs); got != test.want {
++				t.Fatalf("isRK3399 = %t, want %t", got, test.want)
++			}
++		})
++	}
++}
++
++func TestRK3399A53CPUs(t *testing.T) {
++	sysfs := fstest.MapFS{
++		"devices/system/cpu/cpu0/regs/identification/midr_el1": &fstest.MapFile{Data: []byte("0x00000000410fd082\n")},
++		"devices/system/cpu/cpu1/regs/identification/midr_el1": &fstest.MapFile{Data: []byte("0x00000000410fd034\n")},
++		"devices/system/cpu/cpu3/regs/identification/midr_el1": &fstest.MapFile{Data: []byte("0x00000000411fd032\n")},
++		"devices/system/cpu/cpu5/regs/identification/midr_el1": &fstest.MapFile{Data: []byte("0x00000000410fd034\n")},
++	}
++	available := map[int]struct{}{0: {}, 1: {}, 3: {}}
++	if got := rk3399A53CPUs(sysfs, available); got != "1,3" {
++		t.Fatalf("Cortex-A53 CPU set = %q, want %q", got, "1,3")
++	}
++	delete(available, 0)
++	if got := rk3399A53CPUs(sysfs, available); got != "" {
++		t.Fatalf("Cortex-A53-only CPU set needs no startup pin, got %q", got)
++	}
++}
